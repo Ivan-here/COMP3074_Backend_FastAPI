@@ -8,6 +8,7 @@ from openai import OpenAI
 import requests
 from pydantic import BaseModel
 from fastapi import FastAPI, File, UploadFile, HTTPException
+from urllib.parse import urlparse
 
 
 client = OpenAI(
@@ -28,6 +29,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+WIKIPEDIA_HEADERS = {
+    "User-Agent": "TourGuideAI/1.0 (https://example.com; contact@example.com)"
+}
 
 class LandmarkResponse(BaseModel):
     landmark_name: str
@@ -46,7 +50,45 @@ class StoryResponse(BaseModel):
     summary: str
     story: str
 
+WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
+WIKIPEDIA_BASE_PAGE_URL = "https://en.wikipedia.org/wiki/"
 
+
+def get_wikipedia_url(landmark: str) -> str | None:
+    params = {
+        "action": "query",
+        "list": "search",
+        "srsearch": landmark.strip(),
+        "format": "json",
+        "utf8": 1,
+    }
+
+    try:
+        resp = requests.get(WIKIPEDIA_API_URL, headers=WIKIPEDIA_HEADERS, params=params, timeout=5)
+        if resp.status_code != 200:
+            print("Wiki search HTTP error:", resp.status_code)
+            return None
+
+        data = resp.json()
+        search_results = data.get("query", {}).get("search", [])
+        if not search_results:
+            print("Wiki search: no results for", landmark)
+            return None
+
+        top_result = search_results[0]
+        title = top_result.get("title")
+        if not title:
+            print("Wiki search: top result has no title")
+            return None
+
+        slug = title.replace(" ", "_")
+        url = f"{WIKIPEDIA_BASE_PAGE_URL}{slug}"
+        print(f"[Wikipedia] Resolved '{landmark}' -> {url}")
+        return url
+
+    except Exception as e:
+        print("Wiki search exception:", repr(e))
+        return None
 
 @app.post("/recognize-landmark", response_model=LandmarkResponse)
 async def recognize_landmark(image: UploadFile = File(...)):
@@ -97,26 +139,52 @@ async def recognize_landmark(image: UploadFile = File(...)):
 
 
 
+
 def get_wikipedia_summary(landmark: str) -> str | None:
-    """
-    Returns a short summary for the landmark from Wikipedia.
-    If not found, returns None.
-    """
-    # Replace spaces with underscores for Wikipedia URL
-    title = landmark.replace(" ", "_")
-    url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{title}"
+
+    wiki_url = get_wikipedia_url(landmark)
+    if not wiki_url:
+        return None
 
     try:
-        resp = requests.get(url, timeout=5)
+        path = urlparse(wiki_url).path        # "/wiki/CN_Tower"
+        slug = path.rsplit("/", 1)[-1]        # "CN_Tower"
+        title = slug.replace("_", " ")        # "CN Tower" (Wikipedia title format)
+
+        params = {
+            "action": "query",
+            "prop": "extracts",
+            "exintro": 1,         # only intro paragraph
+            "explaintext": 1,     # plain text (no HTML)
+            "titles": title,
+            "format": "json",
+            "utf8": 1,
+        }
+
+        resp = requests.get(WIKIPEDIA_API_URL, params=params, headers=WIKIPEDIA_HEADERS, timeout=5)
         if resp.status_code != 200:
+            print("Wiki summary HTTP error:", resp.status_code)
             return None
 
         data = resp.json()
-        # 'extract' is the short summary field
-        return data.get("extract")
-    except Exception:
-        return None
+        pages = data.get("query", {}).get("pages", {})
+        if not pages:
+            print("Wiki summary: no pages in response")
+            return None
 
+        # pages is a dict keyed by pageid
+        first_page = next(iter(pages.values()))
+        extract = first_page.get("extract")
+        if not extract:
+            print("Wiki summary: 'extract' missing for", title)
+            return None
+
+        print(f"[Wikipedia] Summary found for '{landmark}' via title '{title}'")
+        return extract
+
+    except Exception as e:
+        print("Wiki summary exception:", repr(e))
+        return None
 
 @app.post("/generate-story", response_model=StoryResponse)
 async def generate_story(payload: StoryRequest):
